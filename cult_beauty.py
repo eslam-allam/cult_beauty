@@ -9,8 +9,52 @@ from urllib.parse import urlsplit
 import os
 import pandas as pd
 from selenium.webdriver.support.color import Color
-import traceback
+import time
 from concurrent.futures import ProcessPoolExecutor
+import logging
+import gzip
+import shutil
+import datetime
+from logging.handlers import TimedRotatingFileHandler
+
+LOGGING_LEVEL = logging.DEBUG
+LOGGING_FOLDER = './scraping_logs'
+LOGGING_FILE = f'{LOGGING_FOLDER}/cult_beauty.log'
+
+if not os.path.isdir(LOGGING_FOLDER):
+    os.makedirs(LOGGING_FOLDER)
+
+def rotator(source, dest):
+    with open(source, 'rb') as f_in:
+        with gzip.open(f'{dest}.gz', 'wb') as f_out:
+            shutil.copyfileobj(f_in, f_out)
+    os.remove(source)
+
+def filer(default_name):
+    now = datetime.datetime.now()
+    folder_name = f'{LOGGING_FOLDER}/{now.strftime("%Y")}/{now.strftime("%Y-%m")}'
+    if not os.path.isdir(folder_name):
+        os.makedirs(folder_name)
+    base_name = os.path.basename(default_name)
+    return f'{folder_name}/{base_name}'
+
+logger = logging.getLogger(__name__)
+
+logging_formatter = logging.Formatter(
+    fmt='%(asctime)s %(threadName)s %(levelname)s %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S')
+
+file_handler = TimedRotatingFileHandler(filename=LOGGING_FILE, when='midnight')
+file_handler.setFormatter(logging_formatter)
+file_handler.namer = filer
+file_handler.rotator = rotator
+
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(logging_formatter)
+
+logger.addHandler(file_handler)
+
+logger.setLevel(LOGGING_LEVEL)
 
 
 class ProductType:
@@ -34,7 +78,7 @@ def click_element_refresh_stale(wd: webdriver.WebDriver, element: WebElement, by
             wd.execute_script("arguments[0].click();", element)
             return element
         except Exception:
-            print('Could not click element. Refreshing...')
+            logger.debug('Could not click element. Refreshing...')
             if index is None:
                 element = wd.find_element(by, locator)
             else:
@@ -64,9 +108,8 @@ def get_variation_images(wd: webdriver.WebDriver, variation_details:dict[str, ob
                 found_image = True
                 break
             except StaleElementReferenceException:
-                print(variation_details['product_type'])
                 variation = get_variation_name(variation_details)
-                print(f'image {i + 1} in URL: "{variation_details["product_url"]}" variation: "{variation}" is stale. Refreshing...')
+                logger.debug(f'image {i + 1} in URL: "{variation_details["product_url"]}" variation: "{variation}" is stale. Refreshing...')
                 images = wd.find_elements(By.CLASS_NAME, 'athenaProductImageCarousel_image')
                 if len(images) >= i + 1:
                     image = images[i]
@@ -124,12 +167,12 @@ def get_multi_size_details(wd: webdriver.WebDriver, product_details: dict[str, o
             try:
                 WebDriverWait(wd, 10).until(EC.staleness_of(old_price))
             except Exception:
-                print(f'Could not find old price for url: "{product_details["product_url"]}"')
+                logger.warning(f'Could not find old price for url: "{product_details["product_url"]}"')
             button = wd.find_elements(By.CLASS_NAME, 'athenaProductVariations_box')[i]
         variation_details['size'] = button.text
         variation_details = get_variation_images(wd, variation_details)
         if not variation_details.get('product_image_1', False):
-            print(f'Could not find primary image from URL: "{variation_details["product_url"]}". Size: "{variation_details["size"]}"')
+            logger.error(f'Could not find primary image from URL: "{variation_details["product_url"]}". Size: "{variation_details["size"]}"')
             continue
         product_id = get_id_from_url(variation_details['product_image_1'])
         variation_details = get_variation_misc_details(wd, variation_details, product_id)
@@ -161,7 +204,7 @@ def get_multi_color_details(wd: webdriver.WebDriver, product_details: dict[str, 
         try:
             WebDriverWait(wd, 10).until(EC.staleness_of(old_price))
         except Exception:
-            print(f'Could not find old price for url: "{product_details["product_url"]}", for value')
+            logger.debug(f'Could not find old price for url: "{product_details["product_url"]}", for value')
         if product_type == ProductType.MULTI_COLOR:
             variation_type = 'color'
         elif product_type == ProductType.MULTI_SHADE:
@@ -210,12 +253,12 @@ def get_product_variations_from_type(wd: webdriver.WebDriver, product_details: d
             product_details['product_type'] = ProductType.MULTI_OPTION
             product_variations = get_multi_color_details(wd, product_details, ProductType.MULTI_OPTION)
         else:
-            print(f'Unknown variant type: "{variation}". URL: {url}')
+            logger.error(f'Unknown variant type: "{variation}". URL: {url}')
     else:
         product_details['product_type'] = ProductType.SINGLE
         product_details = get_variation_images(wd, product_details)
         if not product_details.get('product_image_1', False):
-            print(f'Could not find primary image of single product from URL: "{product_details["product_url"]}".')
+            logger.error(f'Could not find primary image of single product from URL: "{product_details["product_url"]}".')
             return product_variations
         product_id = get_id_from_url(product_details['product_image_1'])
         product_details = get_variation_misc_details(wd, product_details, product_id)
@@ -234,9 +277,9 @@ def get_product_descriptions(wd: webdriver.WebDriver, product_details: dict[str,
             description_content = wd.find_element(By.ID, button_id.replace('heading', 'content')).text
             product_details[button.text] = description_content
         except ElementNotInteractableException:
-            print(f'cannot click element with id: {button_id}')
+            logger.debug(f'cannot click element with id: {button_id}')
         except Exception:
-            print(f'Unexpected error occurred: {traceback.format_exc()}')
+            logger.exception('Unexpected error occurred while getting product descriptions.', exc_info=True)
     
     return product_details
 
@@ -258,7 +301,7 @@ def get_product_details(wd:webdriver.WebDriver, urls: list[str]):
             product_variations = get_product_variations_from_type(wd, product_details, url)
             df = pd.concat([df, pd.DataFrame(product_variations)], ignore_index=True)
         except Exception:
-            print(f'Unexpected error with trying to fetch data in url "{url}". \n{traceback.format_exc()}')
+            logger.exception(f'Unexpected error with trying to fetch data in url "{url}".', exc_info=True)
     return df
 
 browser_options = options.Options()
@@ -295,28 +338,35 @@ def get_category_links(browser_options: options.Options, url):
                                                      'button.responsivePaginationNavigationButton.paginationNavigationButtonNext', 5)
 
             if next_page_button is None:
-                print(f'Could not find next button in: "{url}. Page: {page}"')
+                logger.warning(f'Could not find next button in: "{url}. Page: {page}"')
                 return product_details
             if next_page_button.get_attribute('disabled') == 'true':
-                print(f'Successfully fetched all items in: "{url}. Last Page: {page}"')
+                logger.info(f'Successfully fetched all items in: "{url}. Last Page: {page}"')
                 break
             page += 1
         return product_details
 
 def main():
+    start_time = time.time()
     df = pd.DataFrame()
     with ProcessPoolExecutor(max_workers=10) as executor:
         results = executor.map(get_category_links, [browser_options for _ in CATEGORY_LINKS],CATEGORY_LINKS)
     for result in results:
         df = pd.concat([df, result], ignore_index=True)
-    print(df.shape)
-    df.to_excel('./test_cult_beauty_2.xlsx', index=False)
+    logger.info(f'Total data-frame shape: {df.shape}')
+    logger.info("Exporting excel with duplicates...")
+    df.to_excel('./test_cult_beauty_with_duplicates.xlsx', index=False)
+
+    logger.info("Removing duplicate entries...")
     df.drop_duplicates(subset='variant_SKU', inplace=True, ignore_index=True)
+    logger.info('Total data-frame shape after deduplication: %s', df.shape)
     mask = df['productSKU'] == df['variant_SKU']
     transform = df.groupby('productSKU')['productSKU'].transform(create_serialized_sku, mask)
     df[['serialized_primary_SKU', 'is_variant_of']] = pd.DataFrame(transform.to_list(), columns=['serialized_primary_SKU', 'is_variant_of']
                                                                 , index=transform.index)
-    df.to_excel('./test_cult_beauty_3.xlsx', index=False)
+    logger.info("Exporting excel without duplicates...")
+    df.to_excel('./test_cult_beauty_without_duplicates.xlsx', index=False)
+    logger.info('Total execution time: %s', datetime.timedelta(seconds=time.time() - start_time))
 
 if __name__ == '__main__':
     main()
