@@ -11,11 +11,15 @@ import pandas as pd
 from selenium.webdriver.support.color import Color
 import time
 from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import current_process 
 import logging
 import gzip
 import shutil
 import datetime
 from logging.handlers import TimedRotatingFileHandler
+from tqdm import tqdm
+import time
+import re
 
 LOGGING_LEVEL = logging.DEBUG
 LOGGING_FOLDER = './scraping_logs'
@@ -41,7 +45,7 @@ def filer(default_name):
 logger = logging.getLogger(__name__)
 
 logging_formatter = logging.Formatter(
-    fmt='%(asctime)s %(threadName)s %(levelname)s %(message)s',
+    fmt='%(asctime)s %(processName)s %(filename)s Line.%(lineno)d %(levelname)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S')
 
 file_handler = TimedRotatingFileHandler(filename=LOGGING_FILE, when='midnight')
@@ -85,37 +89,57 @@ def click_element_refresh_stale(wd: webdriver.WebDriver, element: WebElement, by
                 element = wd.find_elements(by, locator)[index]
 
 def get_variation_name(variation_details: dict[str, object]):
-    if variation_details['product_type'] == ProductType.MULTI_COLOR:
+    if variation_details is None:
+        return ''
+    product_type = variation_details.get('product_type', None)
+    if product_type == ProductType.MULTI_COLOR:
         variation = variation_details['color']
-    elif variation_details['product_type'] == ProductType.MULTI_SIZE:
+    elif product_type == ProductType.MULTI_SIZE:
         variation = variation_details['size']
-    elif variation_details['product_type'] == ProductType.MULTI_SHADE:
+    elif product_type == ProductType.MULTI_SHADE:
         variation = variation_details['shade']
-    else:
+    elif product_type == ProductType.SINGLE:
         variation = 'single'
+    else:
+        variation = 'NOT_FOUND'
     return variation
+
+def get_attribute_retry_stale(wd: webdriver.WebDriver, element: WebElement ,attribute: str, 
+                              variation_details: dict[str, object], by: By, value: str, 
+                              index = None, label = 'element', max_retries = 5):
+    stale_counter = 0
+    result = None
+
+    if element is None: return None
+    while stale_counter < max_retries:
+        try:
+            result = element.get_attribute(attribute)
+            break
+        except StaleElementReferenceException:
+            variation = get_variation_name(variation_details)
+            logger.debug(f'{label} {index + 1 if index is not None else ""} in URL: "{variation_details["product_url"]}" variation: "{variation}" is stale. Refreshing...')
+            if index is None:
+                searched_element = safe_get_element(wd, by, value)
+                if searched_element is not None:
+                    element = searched_element
+                else:
+                    stale_counter += 1
+            else:
+                elements = wd.find_elements(By.CLASS_NAME, 'athenaProductImageCarousel_image')
+                if len(elements) >= index + 1:
+                    element = elements[index]
+                else:
+                    stale_counter += 1
+    return result
 
 def get_variation_images(wd: webdriver.WebDriver, variation_details:dict[str, object]):
     right_arrow = wd.find_element(By.CLASS_NAME, 'athenaProductImageCarousel_rightArrow')
     for i, image in enumerate(wd.find_elements(By.CLASS_NAME, 'athenaProductImageCarousel_image')):
         if i != 0:
             right_arrow = click_element_refresh_stale(wd, right_arrow, By.CLASS_NAME, 'athenaProductImageCarousel_rightArrow')
-        stale_counter = 0
-        found_image = False
-        while stale_counter < 5:
-            try:
-                image_src = image.get_attribute('src')
-                found_image = True
-                break
-            except StaleElementReferenceException:
-                variation = get_variation_name(variation_details)
-                logger.debug(f'image {i + 1} in URL: "{variation_details["product_url"]}" variation: "{variation}" is stale. Refreshing...')
-                images = wd.find_elements(By.CLASS_NAME, 'athenaProductImageCarousel_image')
-                if len(images) >= i + 1:
-                    image = images[i]
-                else:
-                    stale_counter += 1
-        if not found_image:
+        image_src = get_attribute_retry_stale(wd, image, 'src', variation_details, By.CLASS_NAME
+                                                           , 'athenaProductImageCarousel_image', i, 'image')
+        if image_src is None:
             break
         variation_details[f'product_image_{i+1}'] = image_src
     return variation_details
@@ -129,24 +153,31 @@ def wait_for_presence_get(wd: webdriver.WebDriver, by: By, value: str, wait_for:
 
 def get_variation_misc_details(wd: webdriver.WebDriver, variation_details:dict[str, object], product_id: str):
     variation_details['variant_SKU'] = product_id
-    variation_details['product_name'] = wd.find_element(By.CLASS_NAME, 'productName_title').get_attribute('textContent')
+    product_name = wait_for_presence_get(wd, By.CLASS_NAME, 'productName_title')
+    variation_details['product_name'] = get_attribute_retry_stale(wd, product_name, 'textContent', variation_details
+                                                                ,By.CLASS_NAME, 'productName_title', label='Product name')
     try:
         product_rating = wait_for_presence_get(wd ,By.CLASS_NAME, 'productReviewStarsPresentational')
+
+        product_rating = get_attribute_retry_stale(wd, product_rating, 'aria-label', variation_details, By.CLASS_NAME, 
+                                                   'productReviewStarsPresentational', label='Product rating')
         if product_rating is not None:
-            variation_details['product_rating'] = float(product_rating.get_attribute('aria-label').split(' ')[0])
+            variation_details['product_rating'] = float(product_rating.strip().split(' ')[0])
         else:
             variation_details['product_rating'] = None
     except NoSuchElementException:
         variation_details['product_rating'] = None
     try:
         number_of_reviews = wait_for_presence_get(wd, By.CLASS_NAME, 'productReviewStars_numberOfReviews')
+        number_of_reviews = get_attribute_retry_stale(wd, number_of_reviews, 'textContent', variation_details, By.CLASS_NAME, 
+                                                   'productReviewStars_numberOfReviews', label='Number of reviews')
         if number_of_reviews is not None:
-            variation_details['number_of_reviews'] = int(number_of_reviews.text.split(' ')[0])
+            variation_details['number_of_reviews'] = int(number_of_reviews.strip().split(' ')[0])
         else:
             variation_details['number_of_reviews'] = None
     except NoSuchElementException:
         variation_details['number_of_reviews'] = None
-    variation_details['price'] = wd.find_element(By.CLASS_NAME, 'productPrice_price').text.removeprefix('£')
+    variation_details['price'] = wd.find_element(By.CLASS_NAME, 'productPrice_price').text.strip('£ ')
     try:
         wd.find_element(By.CLASS_NAME, 'productAddToBasket-soldOut')
         variation_details['in_stock'] = 'no'
@@ -234,6 +265,7 @@ def create_serialized_sku(group:pd.Series, mask):
         else:
             serialized_skus.append((f"{row}-{count}", row))
             count += 1
+    return pd.Series(serialized_skus, index=group.index)
 
 def get_product_variations_from_type(wd: webdriver.WebDriver, product_details: dict[str, object], url):
     variation_label = safe_get_element(wd, By.CLASS_NAME, 'athenaProductVariations_dropdownLabel')
@@ -280,12 +312,14 @@ def get_product_descriptions(wd: webdriver.WebDriver, product_details: dict[str,
             logger.debug(f'cannot click element with id: {button_id}')
         except Exception:
             logger.exception('Unexpected error occurred while getting product descriptions.', exc_info=True)
+        time.sleep(ACTION_DELAY_SEC)
     
     return product_details
 
-def get_product_details(wd:webdriver.WebDriver, urls: list[str]):
+def get_product_details(wd:webdriver.WebDriver, urls: list[str], current_bar_position: int):
     df = pd.DataFrame()
-    for url in urls:
+    # TODO add reset and leave = True
+    for url in tqdm(urls, colour='green', position=current_bar_position + 1, desc='Products scanned', unit='Products', leave=False):
         try:
             wd.get(url)
             product_details = {}
@@ -296,77 +330,125 @@ def get_product_details(wd:webdriver.WebDriver, urls: list[str]):
             product_details['brand_name'] = brand_element.get_attribute('title') if brand_element is not None else None
             product_details['brand_logo'] = brand_element.get_attribute('src') if brand_element is not None else None
 
-            product_details['primary_SKU'] = get_id_from_url(wait_for_presence_get(wd, By.CLASS_NAME, 'athenaProductImageCarousel_image').get_attribute('src'))
+            primary_sku = wait_for_presence_get(wd, By.CLASS_NAME, 'athenaProductImageCarousel_image')
+            primary_sku = get_attribute_retry_stale(wd, primary_sku, 'src', product_details, By.CLASS_NAME, 'athenaProductImageCarousel_image',
+                                                    label = 'Primary SKU')
+            if primary_sku is None:
+                logger.error('Could not find primary SKU for URL: "%s". Skipping...', url)
+                continue
+            product_details['primary_SKU'] = get_id_from_url(primary_sku)
             product_details = get_product_descriptions(wd, product_details)
             product_variations = get_product_variations_from_type(wd, product_details, url)
             df = pd.concat([df, pd.DataFrame(product_variations)], ignore_index=True)
+            time.sleep(ACTION_DELAY_SEC)
         except Exception:
             logger.exception(f'Unexpected error with trying to fetch data in url "{url}".', exc_info=True)
+        time.sleep(ACTION_DELAY_SEC)
     return df
 
-browser_options = options.Options()
-browser_options.add_argument('-disable-notifications')
-browser_options.add_experimental_option("prefs", {"profile.default_content_setting_values.cookies": 2})
-browser_options.add_argument('-headless')
-
-color_variation_tags = [x.casefold() for x in ['colour:', 'color:']]
-shade_variation_tags = [x.casefold() for x in ['shade:']]
-size_variation_tags = [x.casefold() for x in ['size:']]
-option_variation_tags = [x.casefold() for x in ['option:']]
-
-CATEGORY_LINKS = ['https://www.cultbeauty.com/body-wellbeing/tanning-suncare/shop-all.list',
-                  'https://www.cultbeauty.com/skin-care.list',
-                  'https://www.cultbeauty.com/make-up.list',
-                  'https://www.cultbeauty.com/hair-care.list',
-                  'https://www.cultbeauty.com/body-wellbeing.list',
-                  'https://www.cultbeauty.com/fragrance.list',
-                  'https://www.cultbeauty.com/gifts.list',
-                  'https://www.cultbeauty.com/minis.list',
-                  'https://www.cultbeauty.com/sale.list',
-                  'https://www.cultbeauty.com/men.list']
-
 def get_category_links(browser_options: options.Options, url):
+    worker = current_process()
+    current_process_id = worker._identity[0]
+    category_name = get_id_from_url(url)
+    worker.name = f'WORKER#{current_process_id}_{category_name}'
+    progress_bar_position = (current_process_id - 1) * 2
     with webdriver.WebDriver(browser_options) as wd:
-        page = 1
-        wd.get(f'{url}?pageNumber={page}')
+        time.sleep(ACTION_DELAY_SEC)
         product_details = pd.DataFrame()
-        while True:
+        wd.get(f'{url}')
+        last_page = wait_for_presence_get(wd, By.CSS_SELECTOR, 'a.responsivePaginationButton.responsivePageSelector.responsivePaginationButton--last')
+        if last_page is not None:
+            last_page = get_attribute_retry_stale(wd, last_page, 'textContent', {}, By.CSS_SELECTOR, 
+                                                  'a.responsivePaginationButton.responsivePageSelector.responsivePaginationButton--last'
+                                                  , label='Last Page button')
+            if last_page is None:
+                logger.warning('Could not find last page button for URL: "%s". Assuming 1 page...', url)
+                last_page = 1
+            else:
+                last_page = int(last_page)
+        for page in tqdm(range(1, last_page + 1), colour='red', position= progress_bar_position, desc='Pages scanned', unit='Pages', postfix = {'category': category_name}):
+            wd.get(f'{url}?pageNumber={page}')
             product_links = list(set([x.find_element(By.CLASS_NAME, 'productBlock_link').get_attribute('href') for x in wd.find_elements(By.CLASS_NAME, 'productBlock_itemDetails_wrapper')]))
-            product_details = pd.concat([product_details, get_product_details(wd, product_links)])
-            
-            next_page_button = wait_for_presence_get(wd, By.CSS_SELECTOR, 
-                                                     'button.responsivePaginationNavigationButton.paginationNavigationButtonNext', 5)
-
-            if next_page_button is None:
-                logger.warning(f'Could not find next button in: "{url}. Page: {page}"')
-                return product_details
-            if next_page_button.get_attribute('disabled') == 'true':
-                logger.info(f'Successfully fetched all items in: "{url}. Last Page: {page}"')
-                break
-            page += 1
+            product_details = pd.concat([product_details, get_product_details(wd, product_links, progress_bar_position)], ignore_index=True)
+            time.sleep(ACTION_DELAY_SEC)
         return product_details
+
+def order_serialized_columns(columns: list[str], regex = r'_(\d+)'):
+    ordered_columns = []
+    groups = {}
+    for i, column in enumerate(columns):
+        index = re.search(regex, column)
+        if index is None or index.group(1) is None:
+            ordered_columns.append(column)
+            continue
+        index = int(index.group(1))
+        group_name = re.sub(regex, '', column)
+        if group_name not in groups:
+            groups[group_name] = {'starting_index': i, 'names': [{'index':index, 'name':column}]}
+        else:
+            groups[group_name]['names'].append({'index':index, 'name':column})
+            if i < groups[group_name]['starting_index']:
+                groups[group_name]['starting_index'] = i
+    for group in groups.values():
+        group['names'] = sorted(group['names'], key=lambda d: d['index'], reverse=True) 
+
+        for name in group['names']:
+            ordered_columns.insert(group['starting_index'], name['name'])
+
+    return ordered_columns
 
 def main():
     start_time = time.time()
     df = pd.DataFrame()
-    with ProcessPoolExecutor(max_workers=10) as executor:
+    with ProcessPoolExecutor(max_workers=10, initializer=tqdm.set_lock, initargs=(tqdm.get_lock(),)) as executor:
         results = executor.map(get_category_links, [browser_options for _ in CATEGORY_LINKS],CATEGORY_LINKS)
     for result in results:
         df = pd.concat([df, result], ignore_index=True)
     logger.info(f'Total data-frame shape: {df.shape}')
+    logger.info('Renaming product_type column...')
+    df.rename({'product_type':'variant_type'}, inplace=True)
+    logger.info('Reordering columns...')
+    df = df.reindex(order_serialized_columns(df.columns), axis=1)
     logger.info("Exporting excel with duplicates...")
     df.to_excel('./test_cult_beauty_with_duplicates.xlsx', index=False)
 
     logger.info("Removing duplicate entries...")
     df.drop_duplicates(subset='variant_SKU', inplace=True, ignore_index=True)
     logger.info('Total data-frame shape after deduplication: %s', df.shape)
-    mask = df['productSKU'] == df['variant_SKU']
-    transform = df.groupby('productSKU')['productSKU'].transform(create_serialized_sku, mask)
+    mask = df['primary_SKU'] == df['variant_SKU']
+    transform = df.groupby('primary_SKU')['primary_SKU'].transform(create_serialized_sku, mask)
+    logger.info("Serializing primary SKU...")
     df[['serialized_primary_SKU', 'is_variant_of']] = pd.DataFrame(transform.to_list(), columns=['serialized_primary_SKU', 'is_variant_of']
                                                                 , index=transform.index)
+    logger.info("Cleaning price column...")
+    df['price'] = df['price'].transform(lambda x: re.sub(r'[^\d.]', '', x))
+
+    logger.info("Dropping empty columns...")
+    df.dropna(axis=1, how='all', inplace=True)
     logger.info("Exporting excel without duplicates...")
     df.to_excel('./test_cult_beauty_without_duplicates.xlsx', index=False)
     logger.info('Total execution time: %s', datetime.timedelta(seconds=time.time() - start_time))
 
 if __name__ == '__main__':
+    ACTION_DELAY_SEC = 1
+    browser_options = options.Options()
+    browser_options.add_argument('-disable-notifications')
+    browser_options.add_experimental_option("prefs", {"profile.default_content_setting_values.cookies": 2})
+    browser_options.add_argument('-headless')
+
+    color_variation_tags = [x.casefold() for x in ['colour:', 'color:']]
+    shade_variation_tags = [x.casefold() for x in ['shade:']]
+    size_variation_tags = [x.casefold() for x in ['size:']]
+    option_variation_tags = [x.casefold() for x in ['option:']]
+
+    CATEGORY_LINKS = ['https://www.cultbeauty.com/body-wellbeing/tanning-suncare/shop-all.list',
+                    'https://www.cultbeauty.com/skin-care.list',
+                    'https://www.cultbeauty.com/make-up.list',
+                    'https://www.cultbeauty.com/hair-care.list',
+                    'https://www.cultbeauty.com/body-wellbeing.list',
+                    'https://www.cultbeauty.com/fragrance.list',
+                    'https://www.cultbeauty.com/gifts.list',
+                    'https://www.cultbeauty.com/minis.list',
+                    'https://www.cultbeauty.com/sale.list',
+                    'https://www.cultbeauty.com/men.list']
     main()
