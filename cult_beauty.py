@@ -471,11 +471,15 @@ def main():
         
         for result in results:
             df = pd.concat([df, result], ignore_index=True)
+        
         logger.info(f'Total data-frame shape: {df.shape}')
+
         logger.info('Renaming product_type column...')
         df.rename({'product_type':'variant_type'}, inplace=True)
+
         logger.info('Reordering columns...')
         df = df.reindex(order_serialized_columns(df.columns), axis=1)
+
         logger.info("Exporting excel with duplicates...")
         df.to_excel('./test_cult_beauty_with_duplicates.xlsx', index=False)
 
@@ -533,7 +537,7 @@ if __name__ == '__main__':
     NUM_OF_WORKERS = 10
     browser_options = options.Options()
     browser_options.add_argument('-disable-notifications')
-    # browser_options.add_argument('-headless')
+    browser_options.add_argument('-headless')
 
     color_variation_tags = [x.casefold() for x in ['colour:', 'color:']]
     shade_variation_tags = [x.casefold() for x in ['shade:']]
