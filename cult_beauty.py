@@ -568,7 +568,7 @@ def get_product_descriptions(wd: webdriver.WebDriver, product_details: dict[str,
     
     return product_details
 
-def scrape_pages(wd:webdriver.WebDriver, urls: list[str], product_category: str, progress_bar: tqdm):
+def get_products_from_page(wd:webdriver.WebDriver, urls: list[str], product_category: str, progress_bar: tqdm):
     """get product details of every url (product)
 
     Args:
@@ -656,7 +656,7 @@ def scrape_category_url(browser_options: options.Options, url: str):
         for page in tqdm(range(1, last_page + 1), colour='red', position= progress_bar_position, desc='Pages scanned', unit='Pages', postfix = {'category': category_name}, leave=True):
             wd.get(f'{url}?pageNumber={page}')
             product_links = list(set([x.find_element(By.CLASS_NAME, 'productBlock_link').get_attribute('href') for x in wd.find_elements(By.CLASS_NAME, 'productBlock_itemDetails_wrapper')]))
-            product_details = pd.concat([product_details, scrape_pages(wd, product_links, category_name, inner_bar)], ignore_index=True)
+            product_details = pd.concat([product_details, get_products_from_page(wd, product_links, category_name, inner_bar)], ignore_index=True)
             time.sleep(ACTION_DELAY_SEC)
         return product_details
 
